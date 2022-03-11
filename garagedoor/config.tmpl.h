@@ -1,0 +1,6 @@
+#define HOSTNAME        "GarageDoor"
+#define WLAN_SSID       "SSID"
+#define WLAN_PASS       "PASS"
+#define APP_KEY         "APP_KEY"
+#define APP_SECRET      "APP_SECRET"
+#define DEVICE_ID       "deviceId"
