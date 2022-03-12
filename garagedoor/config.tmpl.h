@@ -4,3 +4,4 @@
 #define APP_KEY         "APP_KEY"
 #define APP_SECRET      "APP_SECRET"
 #define DEVICE_ID       "deviceId"
+#define PASSCODE        "passcode"

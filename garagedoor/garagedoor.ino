@@ -1,7 +1,18 @@
+#ifdef DEBUG_ESP_PORT
+  #define DEBUG_MSG(...) Serial.println( __VA_ARGS__ )
+  #define DEBUG_WRITE(...) Serial.write( __VA_ARGS__ )
+  #define DEBUG_MSG_(...) Serial.print( __VA_ARGS__ )
+#else
+  #define DEBUG_MSG(...)
+  #define DEBUG_WRITE(...)
+  #define DEBUG_MSG_(...)
+#endif
+
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
+#include <ESP8266WebServer.h>
 
 #include <SinricPro.h>
 #include <SinricProSwitch.h>
@@ -75,6 +86,8 @@ bool lastNotifiedValue = false;
 
 void ICACHE_RAM_ATTR motorChanged();
 
+ESP8266WebServer server(80);
+
 void setup() {
 
   DOOR_CLOSING.motorStopped = &DOOR_WILL_OPEN_ON_TOGGLE;
@@ -95,6 +108,9 @@ void setup() {
   WiFi.mode(WIFI_STA);    
   WiFi.begin(WLAN_SSID, WLAN_PASS);
 
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.begin();
+
   SinricProSwitch& mySwitch = SinricPro[DEVICE_ID];
   mySwitch.onPowerState(onPowerState);
 
@@ -110,6 +126,9 @@ void setup() {
   });
   SinricPro.begin(APP_KEY, APP_SECRET);
 
+  server.on("/", HTTP_GET, handleHttp);
+  server.begin();
+
 }
 
 void loop() {
@@ -123,9 +142,11 @@ void loop() {
 
   SinricPro.handle();
   ArduinoOTA.handle();
+  server.handleClient();
 }
 
 void toggle() {
+  DEBUG_MSG("toggle");
   digitalWrite(LED_BUILTIN, LOW);  
   digitalWrite(OUTPUT_PIN, HIGH);
   delay(500);
@@ -192,4 +213,17 @@ bool onPowerState(const String &deviceId, bool &updatedState) {
 void publishState() {
   SinricProSwitch& mySwitch = SinricPro[DEVICE_ID];
   mySwitch.sendPowerStateEvent(currentState->valueToNotify);
+}
+
+void handleHttp() {
+  if (!server.hasArg("pass")) {
+    server.send(401, "text/plain", "Requires pass");
+    return;
+  }
+  if (!server.arg("pass").equals(PASSCODE)) {
+    server.send(401, "text/plain", "Invalid pass");
+    return;
+  }
+  toggle();
+  server.send(200, "text/plain", "ok");
 }
