@@ -213,6 +213,7 @@ bool onPowerState(const String &deviceId, bool &updatedState) {
 void publishState() {
   SinricProSwitch& mySwitch = SinricPro[DEVICE_ID];
   mySwitch.sendPowerStateEvent(currentState->valueToNotify);
+  lastNotifiedValue = currentState->valueToNotify;
 }
 
 void handleHttp() {
