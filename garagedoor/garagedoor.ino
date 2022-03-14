@@ -109,6 +109,7 @@ void setup() {
   WiFi.begin(WLAN_SSID, WLAN_PASS);
 
   ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.setPassword(PASSCODE);
   ArduinoOTA.begin();
 
   SinricProSwitch& mySwitch = SinricPro[DEVICE_ID];
