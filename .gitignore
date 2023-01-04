@@ -1,1 +1,4 @@
 config.h
+.pio
+.DS_Store
+.vscode

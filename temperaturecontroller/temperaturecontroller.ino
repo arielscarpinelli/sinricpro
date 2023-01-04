@@ -29,8 +29,8 @@
 #define HEAT_SOURCE_PIN D1
 #define HEAT_DESTINATION_PIN D2
 
-#define RELAY_1 D5
-#define RELAY_2 D6
+#define RELAY_PUMP D5
+#define RELAY_VALVE D6
 
 #define SECONDARY_LED D4
 
@@ -39,7 +39,6 @@
 
 #define DEFAULT_MIN_REPORTING_INTERVAL_MILLIS 30000 // 30 secs
 
-void onMqttMessage(char* topic, byte* payload, unsigned int length);
 /************ Global State (you don't need to change this!) ******************/
 
 ESP8266WebServer server(80);
@@ -78,6 +77,7 @@ typedef struct PersitentState {
   int cleaningStartMinute;
   int cleaningDurationMinutes;
   int drainSeconds;
+  int prestartSeconds;
 };
 
 struct TransientState {
@@ -89,8 +89,11 @@ struct TransientState {
   unsigned int heatSourceAverageTemperatureCount;
   float heatSourceMaxTemperature;
   bool pumpRunning;
+  bool valveOpen;
   unsigned long drainStartedMillis;
+  unsigned long lastStartedMillis;
   bool forcePump;
+  bool forceValve;
   bool cleaning;
   unsigned long minReportingIntervalMillis;
   unsigned long publishedMillis;
@@ -109,10 +112,11 @@ void resetPersistentState() {
   persistentState.upperTemperatureThreshold = 8;
   persistentState.minTemperature = 20;
   persistentState.timezoneOffsetSeconds = 0;
-  persistentState.cleaningStartHour = 12;
+  persistentState.cleaningStartHour = 9;
   persistentState.cleaningStartMinute = 0;
   persistentState.cleaningDurationMinutes = 10;
   persistentState.drainSeconds = 15;
+  persistentState.prestartSeconds = 45;
 }
 
 void resetTransientState(TransientState &state) {
@@ -121,42 +125,56 @@ void resetTransientState(TransientState &state) {
   state.heatSinkTemperature = 0;
   state.cleaning = false;
   state.pumpRunning = false;
+  state.valveOpen = false;
   state.heatSourceFailure = false;
   state.heatSinkFailure = false;
   state.drainStartedMillis = 0;
+  state.lastStartedMillis = 0;
   state.minReportingIntervalMillis = DEFAULT_MIN_REPORTING_INTERVAL_MILLIS;
 }
 
-void persistentStateToJson(JsonObject &json) {
-  json["thermostatMode"] = persistentState.enabled ? "heat" : "off";
-  json["thermostatTemperatureSetpoint"] = persistentState.desiredTemperature;
-  json["upperTemperatureThreshold"] = persistentState.upperTemperatureThreshold;
-  json["lowerTemperatureThreshold"] = persistentState.lowerTemperatureThreshold;
-  json["maxTemperature"] = persistentState.maxTemperature;
-  json["minTemperature"] = persistentState.minTemperature;
-  json["timezoneOffsetSeconds"] = persistentState.timezoneOffsetSeconds;
-  json["cleaningStartHour"] = persistentState.cleaningStartHour;
-  json["cleaningStartMinute"] = persistentState.cleaningStartMinute;
-  json["cleaningDurationMinutes"] = persistentState.cleaningDurationMinutes;
-  json["drainSeconds"] = persistentState.drainSeconds;
-
-  // Albeit this is transient, it is a config, not a read value
-  json["minReportingIntervalMillis"] = transientState.minReportingIntervalMillis;
-
-  if (transientState.forcePump) {
-    json["forcePump"] = transientState.forcePump;
+class JsonStateSerializer : public StateSerializer {
+  JsonObject &json;
+public:
+  JsonStateSerializer(JsonObject &json) : json(json) {};
+  virtual void sendRangeValue(const String& instance, float value) {
+    json[instance] = value;
   }
+  virtual void sendPowerState(bool value) {
+    json["enabled"] = value;
+  }
+};
 
+void serializePersistentState(StateSerializer& ser) {
+  ser.sendRangeValue("targetTemperature", persistentState.desiredTemperature);
+  ser.sendPowerState(persistentState.enabled);
+  ser.sendRangeValue("upperTemperatureThreshold", persistentState.upperTemperatureThreshold);
+  ser.sendRangeValue("lowerTemperatureThreshold", persistentState.lowerTemperatureThreshold);
+  ser.sendRangeValue("maxTemperature", persistentState.maxTemperature);
+  ser.sendRangeValue("minTemperature", persistentState.minTemperature);
+  ser.sendRangeValue("timezoneOffsetSeconds", persistentState.timezoneOffsetSeconds);
+  ser.sendRangeValue("cleaningStartHour", persistentState.cleaningStartHour);
+  ser.sendRangeValue("cleaningStartMinute", persistentState.cleaningStartMinute);
+  ser.sendRangeValue("cleaningDurationMinutes", persistentState.cleaningDurationMinutes);
+  ser.sendRangeValue("drainSeconds", persistentState.drainSeconds);
+  ser.sendRangeValue("prestartSeconds", persistentState.prestartSeconds);
+}
+
+void persistentStateToJson(JsonObject &json) {
+  auto ser = JsonStateSerializer(json);
+  serializePersistentState(ser);
 }
 
 void transientStateToJson(JsonObject& json) {
   
   json["heatSourceTemperature"] = transientState.heatSourceTemperature;
+  json["heatSourceAverageTemperature"] = transientState.heatSourceAverageTemperatureSum /  transientState.heatSourceAverageTemperatureCount;
+  json["heatSourceMaxTemperature"] = transientState.heatSourceMaxTemperature;
   if (transientState.heatSourceFailure) {
     json["heatSourceFailure"] = true;
   }
 
-  json["thermostatTemperatureAmbient"] = transientState.heatSinkTemperature;
+  json["heatSinkTemperature"] = transientState.heatSinkTemperature;
   if (transientState.heatSinkFailure) {
     json["heatSinkFailure"] = true;
   }
@@ -165,29 +183,36 @@ void transientStateToJson(JsonObject& json) {
     json["pumpRunning"] = true;
   }
 
-  bool draining = (transientState.drainStartedMillis > 0);
-  if (draining) {
-    json["draining"] = draining;
-    json["heatSourceAverageTemperature"] = transientState.heatSourceAverageTemperatureSum /  transientState.heatSourceAverageTemperatureCount;
-    json["heatSourceMaxTemperature"] = transientState.heatSourceMaxTemperature;
-  }
-
   if (transientState.cleaning) {
     json["cleaning"] = transientState.cleaning;
   }
   
+  json["minReportingIntervalMillis"] = transientState.minReportingIntervalMillis;
+
+  if (transientState.forcePump) {
+    json["forcePump"] = transientState.forcePump;
+  }
+
+  if (transientState.forceValve) {
+    json["forceValve"] = transientState.forceValve;
+  }
+
 }
 
+bool timeIsUp(unsigned long startedMillis, unsigned long durationMillis, unsigned long nowMillis) {
+  return ((startedMillis + durationMillis) <= nowMillis) || 
+      (nowMillis < startedMillis); // watches for overflow
+}
 
 void setup() {
 
   Serial.begin(74880);
   delay(10);
 
-  pinMode(RELAY_1, RELAY_PIN_OUTPUT_MODE);
-  digitalWrite(RELAY_1, RELAY_STATE_OFF);
-  pinMode(RELAY_2, RELAY_PIN_OUTPUT_MODE);
-  digitalWrite(RELAY_2, RELAY_STATE_OFF);
+  pinMode(RELAY_PUMP, RELAY_PIN_OUTPUT_MODE);
+  digitalWrite(RELAY_PUMP, RELAY_STATE_OFF);
+  pinMode(RELAY_VALVE, RELAY_PIN_OUTPUT_MODE);
+  digitalWrite(RELAY_VALVE, RELAY_STATE_OFF);
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
@@ -221,42 +246,28 @@ void loadState() {
 void saveState() {
   EEPROM.put(0, persistentState);
   EEPROM.commit();
-  publishPersistentState();
 }
 
 void publishPersistentState() {
-  
-  conn.sendUpdate([](JsonObject &json) {
-    persistentStateToJson(json);
-  });
-
+  // serializePersistentState(conn);
 }
 
 ErrorReason handleUpdate(JsonObject& params) {
   bool processed = false;
 
-  if (params.containsKey("thermostatMode")) {
-    String mode = params["thermostatMode"];
-    if (mode == "heat") {
-      persistentState.enabled = true;
-      processed = true;
-    } else if (mode == "off") {
-      persistentState.enabled = false;
-      processed = true;
-    } else {
-      // received a mode that we don't support
-      return "thermostatMode";
-    }
-
+  if (params.containsKey("setPowerState")) {
+    JsonVariant point = params["setPowerState"];
+    persistentState.enabled = point == "On";
+    processed = true;
   }
 
-  if (params.containsKey("thermostatTemperatureSetpoint")) {
-    JsonVariant point = params["thermostatTemperatureSetpoint"];
+  if (params.containsKey("targetTemperature")) {
+    JsonVariant point = params["targetTemperature"];
     if (point.is<float>()) {
       persistentState.desiredTemperature = point;
       processed = true;
     } else {
-      return "thermostatTemperatureSetpoint";
+      return "targetTemperature";
     }
   }
 
@@ -350,13 +361,39 @@ ErrorReason handleUpdate(JsonObject& params) {
     }
   }
 
+  if (params.containsKey("prestartSeconds")) {
+    JsonVariant point = params["prestartSeconds"];
+    if (point.is<int>()) {
+      persistentState.prestartSeconds = point;
+      processed = true;
+    } else {
+      return "prestartSeconds";
+    }
+  }
+
   if (params.containsKey("forcePump")) {
     JsonVariant point = params["forcePump"];
     if (point.is<boolean>()) {
       transientState.forcePump = point;
       processed = true;
+    } else if (point.is<String>()) {
+      transientState.forcePump = point == "On";
+      processed = true;
     } else {
       return "forcePump";
+    }
+  }
+
+  if (params.containsKey("forceValve")) {
+    JsonVariant point = params["forceValve"];
+    if (point.is<boolean>()) {
+      transientState.forceValve = point;
+      processed = true;
+    } else if (point.is<String>()) {
+      transientState.forceValve = point == "On";
+      processed = true;
+    } else {
+      return "forceValve";
     }
   }
 
@@ -383,22 +420,32 @@ void publishIfNeeded() {
     return;
   }
 
-  bool changedDest = roundAndCheckIfChanged(transientState.heatSinkTemperature, lastPublishedState.heatSinkTemperature);
+  bool changedSink = roundAndCheckIfChanged(transientState.heatSinkTemperature, lastPublishedState.heatSinkTemperature);
   bool failedSink = (transientState.heatSinkFailure != lastPublishedState.heatSinkFailure);
   bool changedSource = roundAndCheckIfChanged(transientState.heatSourceTemperature, lastPublishedState.heatSourceTemperature);
   bool failedSource = (transientState.heatSourceFailure != lastPublishedState.heatSourceFailure);
   bool changedPumpState = (transientState.pumpRunning != lastPublishedState.pumpRunning);
-  bool changedDrainingState = (transientState.drainStartedMillis != lastPublishedState.drainStartedMillis);
-  bool changedCleaningState = (transientState.cleaning != lastPublishedState.cleaning);
 
-  bool shouldForcePublish = failedSink || failedSource || changedPumpState || changedDrainingState || changedCleaningState;
+  bool shouldForcePublish = failedSink || failedSource || changedPumpState;
 
-  if (changedDest || changedSource || shouldForcePublish) {
+  if (changedSink || changedSource || shouldForcePublish) {
     unsigned long now = millis();
     if (timeIsUp(lastPublishedState.publishedMillis, transientState.minReportingIntervalMillis, now) || shouldForcePublish)  {
-      conn.sendUpdate([=](JsonObject& json) {
-        transientStateToJson(json);
-      });
+      if (changedSink) {
+        conn.sendRangeValue("heatSinkTemperature", transientState.heatSinkTemperature);
+      }
+      if (failedSink) {
+        conn.notifyError("Unable to read temperature");
+      }
+      if (changedSource) {
+        conn.sendRangeValue("heatSourceTemperature", transientState.heatSourceTemperature);
+      }
+      if (failedSource) {
+        conn.notifyError("Unable to read source temperature");
+      }
+      if (changedPumpState) {
+        conn.sendModeValue("pumpRunning", transientState.pumpRunning);
+      }
       lastPublishedState = transientState;
       lastPublishedState.publishedMillis = now;
     }
@@ -414,24 +461,22 @@ bool roundAndCheckIfChanged(float &temp, float last) {
 
 }
 
+unsigned long now;
+
 void loop() {
+
+  now = millis();
 
   conn.loop();
   updateTemps();
-  updateRelays();
+  updatePump();
+  updateValve();
   publishIfNeeded();
   server.handleClient();
   loopOTA();
 #ifdef DEBUG_ESP_PORT
   readAndSimulateTemp();
 #endif
-}
-
-void disable() {
-  if (persistentState.enabled) {
-    persistentState.enabled = false;
-    publishPersistentState();  
-  }  
 }
 
 void updateTemps() {
@@ -481,7 +526,7 @@ bool applyCleaning() {
   
 }
 
-void updateRelays() {
+void updatePump() {
 
   if(transientState.forcePump) {
     pumpSet(true);
@@ -543,37 +588,48 @@ void updateRelays() {
   
 }
 
+inline int relayState(bool v) {
+  return v ? RELAY_STATE_ON : RELAY_STATE_OFF;
+}
+
 void pumpSet(bool v) {
 
   if(transientState.pumpRunning != v) {
     if (v) {
+      transientState.lastStartedMillis = now;
       transientState.drainStartedMillis = 0;
     } else {
-      unsigned long now = millis();
       if (!transientState.drainStartedMillis) {
-        DEBUG_MSG_("Starting draining");
+        DEBUG_MSG("Starting draining");
         transientState.drainStartedMillis = now;
       }
       if (!timeIsUp(transientState.drainStartedMillis, persistentState.drainSeconds * 1000, now)){
         return;
       }
       transientState.drainStartedMillis = 0;
-      DEBUG_MSG_("Draining ended");
+      DEBUG_MSG("Draining ended");
     }
-    int val = v ? RELAY_STATE_ON : RELAY_STATE_OFF;
+    int pump = relayState(v);
+
     DEBUG_MSG_("Setting pump to: ");
     DEBUG_MSG(v);
-    digitalWrite(RELAY_1, val);
-    digitalWrite(RELAY_2, val);
-    digitalWrite(SECONDARY_LED, val);
+    digitalWrite(RELAY_PUMP, pump);
+    digitalWrite(SECONDARY_LED, pump);
     transientState.pumpRunning = v;
   }
   
 }
 
-bool timeIsUp(unsigned long startedMillis, unsigned long durationMillis, unsigned long nowMillis) {
-  return ((startedMillis + durationMillis) <= nowMillis) || 
-      (nowMillis < startedMillis); // watches for overflow
+void updateValve() {
+  int valve = transientState.forceValve ||
+      (transientState.pumpRunning && timeIsUp(transientState.lastStartedMillis, persistentState.prestartSeconds * 1000, now));
+
+  if (valve != transientState.valveOpen) {
+    DEBUG_MSG_("Setting valve to: ");
+    DEBUG_MSG(valve);
+    digitalWrite(RELAY_PUMP, valve);
+    transientState.valveOpen = valve;
+  }
 }
 
 void handleGetStatus() {
