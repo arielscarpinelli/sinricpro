@@ -43,6 +43,7 @@ protected:
   bool connected = false;
   time_t connectionUpdatedAt;
   unsigned long nextDelayMillis = 0;
+  unsigned long now = 0;
 
   SolarPoolHeather &solarPoolHeather = SinricPro[DEVICE_ID];
 
@@ -108,12 +109,16 @@ public:
   }
 
   void delay(unsigned long millisToWait) {
-    nextDelayMillis = millis() + millisToWait;
+    nextDelayMillis = this->now + millisToWait;
   }
 
-  void loop() {
+  void loop(unsigned long now) {
 
-    if (millis() < nextDelayMillis) {
+    SinricPro.handle();
+
+    this->now = now;
+
+    if (now < nextDelayMillis) {
       delay(0);
       return;
     }
@@ -163,9 +168,6 @@ public:
     } else {
       MDNS.update();
     }
-
-    SinricPro.handle();
-    SinricPro.handle();
   }
 
   bool isConnected() {

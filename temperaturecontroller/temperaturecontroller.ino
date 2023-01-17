@@ -2,6 +2,7 @@
   #define DEBUG_MSG(...) Serial.println( __VA_ARGS__ )
   #define DEBUG_WRITE(...) Serial.write( __VA_ARGS__ )
   #define DEBUG_MSG_(...) Serial.print( __VA_ARGS__ )
+  //#define SIMULATE_TEMP 1
 #else
   #define DEBUG_MSG(...)
   #define DEBUG_WRITE(...)
@@ -38,6 +39,7 @@
 #define RELAY_STATE_OFF HIGH
 
 #define DEFAULT_MIN_REPORTING_INTERVAL_MILLIS 30000 // 30 secs
+#define FAILURE_REPORT_THRESHOLD 10
 
 /************ Global State (you don't need to change this!) ******************/
 
@@ -78,13 +80,17 @@ typedef struct PersitentState {
   int cleaningDurationMinutes;
   int drainSeconds;
   int prestartSeconds;
+  int stagnantTemperatureCheckIntervalMins;
+  int prestartCycles;
 };
 
 struct TransientState {
   float heatSourceTemperature;
   bool heatSourceFailure;
+  unsigned long heatSourceFailureCount;
   float heatSinkTemperature;
   bool heatSinkFailure;
+  unsigned long heatSinkFailureCount;
   float heatSourceAverageTemperatureSum;
   unsigned int heatSourceAverageTemperatureCount;
   float heatSourceMaxTemperature;
@@ -92,6 +98,7 @@ struct TransientState {
   bool valveOpen;
   unsigned long drainStartedMillis;
   unsigned long lastStartedMillis;
+  unsigned int prestartCurrentCycle;
   bool forcePump;
   bool forceValve;
   bool cleaning;
@@ -117,6 +124,8 @@ void resetPersistentState() {
   persistentState.cleaningDurationMinutes = 10;
   persistentState.drainSeconds = 15;
   persistentState.prestartSeconds = 45;
+  persistentState.prestartCycles = 2;
+  persistentState.stagnantTemperatureCheckIntervalMins = 30;
 }
 
 void resetTransientState(TransientState &state) {
@@ -127,9 +136,12 @@ void resetTransientState(TransientState &state) {
   state.pumpRunning = false;
   state.valveOpen = false;
   state.heatSourceFailure = false;
+  state.heatSourceFailureCount = 0;
   state.heatSinkFailure = false;
+  state.heatSinkFailureCount = 0;
   state.drainStartedMillis = 0;
   state.lastStartedMillis = 0;
+  state.prestartCurrentCycle = 0;
   state.minReportingIntervalMillis = DEFAULT_MIN_REPORTING_INTERVAL_MILLIS;
 }
 
@@ -158,6 +170,8 @@ void serializePersistentState(StateSerializer& ser) {
   ser.sendRangeValue("cleaningDurationMinutes", persistentState.cleaningDurationMinutes);
   ser.sendRangeValue("drainSeconds", persistentState.drainSeconds);
   ser.sendRangeValue("prestartSeconds", persistentState.prestartSeconds);
+  ser.sendRangeValue("prestartCycles", persistentState.prestartCycles);
+  ser.sendRangeValue("stagnantTemperatureCheckIntervalMins", persistentState.stagnantTemperatureCheckIntervalMins); 
 }
 
 void persistentStateToJson(JsonObject &json) {
@@ -183,10 +197,18 @@ void transientStateToJson(JsonObject& json) {
     json["pumpRunning"] = true;
   }
 
+  if (transientState.valveOpen) {  
+    json["valveOpen"] = true;
+  }
+
   if (transientState.cleaning) {
     json["cleaning"] = transientState.cleaning;
   }
-  
+
+  if (transientState.prestartCurrentCycle) {
+    json["prestartCurrentCycle"] = transientState.prestartCurrentCycle;
+  }
+
   json["minReportingIntervalMillis"] = transientState.minReportingIntervalMillis;
 
   if (transientState.forcePump) {
@@ -371,6 +393,26 @@ ErrorReason handleUpdate(JsonObject& params) {
     }
   }
 
+  if (params.containsKey("prestartCycles")) {
+    JsonVariant point = params["prestartCycles"];
+    if (point.is<int>()) {
+      persistentState.prestartCycles = point;
+      processed = true;
+    } else {
+      return "prestartCycles";
+    }
+  }
+
+  if (params.containsKey("stagnantTemperatureCheckIntervalMins")) {
+    JsonVariant point = params["stagnantTemperatureCheckIntervalMins"];
+    if (point.is<int>()) {
+      persistentState.stagnantTemperatureCheckIntervalMins = point;
+      processed = true;
+    } else {
+      return "stagnantTemperatureCheckIntervalMins";
+    }
+  }
+
   if (params.containsKey("forcePump")) {
     JsonVariant point = params["forcePump"];
     if (point.is<boolean>()) {
@@ -467,34 +509,50 @@ void loop() {
 
   now = millis();
 
-  conn.loop();
+  conn.loop(now);
   updateTemps();
   updatePump();
   updateValve();
   publishIfNeeded();
   server.handleClient();
   loopOTA();
-#ifdef DEBUG_ESP_PORT
+#ifdef SIMULATE_TEMP
   readAndSimulateTemp();
 #endif
 }
 
+unsigned long lastTempRead = 0;
+
 void updateTemps() {
+
+  // Give more CPU time to comms when trying to connect.
+  if (!conn.isConnected()) {
+    if (!timeIsUp(lastTempRead, 5000, now)) {
+      return;
+    }
+    lastTempRead = now;
+  }
   
   //DEBUG_MSG_("Heat source");
   if(heatSource.read()) {
     transientState.heatSourceTemperature = heatSource.value;
     transientState.heatSourceFailure = false;
-  } else {
-    transientState.heatSourceFailure = true;
+  } else if (!transientState.heatSourceFailure) {
+    transientState.heatSourceFailureCount++;
+    if (transientState.heatSourceFailureCount > FAILURE_REPORT_THRESHOLD) {
+      transientState.heatSourceFailure = true;
+    }
   }
 
   //DEBUG_MSG_("Heat sink");
   if(heatSink.read()) {
     transientState.heatSinkTemperature = heatSink.value;
     transientState.heatSinkFailure = false;
-  } else {
-    transientState.heatSinkFailure = true;
+  } else if (!transientState.heatSinkFailure) {
+    transientState.heatSinkFailureCount++;
+    if (transientState.heatSinkFailureCount > FAILURE_REPORT_THRESHOLD) {
+      transientState.heatSinkFailure = true;
+    }
   }
 
 }
@@ -564,20 +622,19 @@ void updatePump() {
   DEBUG_MSG_(" h ");
   DEBUG_MSG(heatTemperatureDiff);
 
-  if ((!transientState.pumpRunning) && desiredTempDiff) {
-    if ((heatTemperatureDiff >= persistentState.upperTemperatureThreshold) || 
-        ((transientState.heatSourceTemperature >= persistentState.maxTemperature) && heatTempDiffOverLowerThreshold)) {
-      
-      
-      transientState.heatSourceAverageTemperatureCount = 1;
-      transientState.heatSourceAverageTemperatureSum = transientState.heatSourceTemperature;
-      transientState.heatSourceMaxTemperature = transientState.heatSourceTemperature;
+  if (!transientState.pumpRunning) {
+    if(desiredTempDiff) {
+      if ((heatTemperatureDiff >= persistentState.upperTemperatureThreshold) || 
+          ((transientState.heatSourceTemperature >= persistentState.maxTemperature) && heatTempDiffOverLowerThreshold)) {
+        pumpSet(true);
+      }
+    } else if (persistentState.stagnantTemperatureCheckIntervalMins > 0 && timeIsUp(transientState.lastStartedMillis, persistentState.stagnantTemperatureCheckIntervalMins * 60000, now)) {
       pumpSet(true);
     }
   } else {
     if (!heatTempDiffOverLowerThreshold) {
       pumpSet(false);
-    } else if (transientState.pumpRunning) {
+    } else {
       transientState.heatSourceAverageTemperatureCount++;
       transientState.heatSourceAverageTemperatureSum += transientState.heatSourceTemperature;
       if (transientState.heatSourceTemperature > transientState.heatSourceMaxTemperature) {
@@ -598,6 +655,9 @@ void pumpSet(bool v) {
     if (v) {
       transientState.lastStartedMillis = now;
       transientState.drainStartedMillis = 0;
+      transientState.heatSourceAverageTemperatureCount = 1;
+      transientState.heatSourceAverageTemperatureSum = transientState.heatSourceTemperature;
+      transientState.heatSourceMaxTemperature = transientState.heatSourceTemperature;
     } else {
       if (!transientState.drainStartedMillis) {
         DEBUG_MSG("Starting draining");
@@ -621,20 +681,44 @@ void pumpSet(bool v) {
 }
 
 void updateValve() {
+
+  bool prestartFinishedOrOpenValveCycle = false;
+
+  if(!transientState.pumpRunning) {
+    transientState.prestartCurrentCycle = 0;
+  } else {
+    int totalCycles = persistentState.prestartCycles * 2 - 1;
+
+    if (transientState.prestartCurrentCycle < totalCycles) {
+      bool currentCycleFinished = timeIsUp(transientState.lastStartedMillis, (persistentState.prestartSeconds * 1000) * (transientState.prestartCurrentCycle + 1), now);
+
+      if (currentCycleFinished) {
+        transientState.prestartCurrentCycle++;
+      }
+
+      prestartFinishedOrOpenValveCycle = ((transientState.prestartCurrentCycle % 2) == 1);
+
+    } else {
+      prestartFinishedOrOpenValveCycle = true;
+    }
+
+  }
+
+
   int valve = transientState.forceValve ||
-      (transientState.pumpRunning && timeIsUp(transientState.lastStartedMillis, persistentState.prestartSeconds * 1000, now));
+      (transientState.pumpRunning && !transientState.forcePump && prestartFinishedOrOpenValveCycle);
 
   if (valve != transientState.valveOpen) {
     DEBUG_MSG_("Setting valve to: ");
     DEBUG_MSG(valve);
-    digitalWrite(RELAY_PUMP, valve);
+    digitalWrite(RELAY_VALVE, relayState(valve));
     transientState.valveOpen = valve;
   }
 }
 
 void handleGetStatus() {
   
-  const size_t capacity = JSON_OBJECT_SIZE(40);
+  const size_t capacity = JSON_OBJECT_SIZE(80);
   DynamicJsonDocument doc(capacity);
 
   doc["id"] = String(ESP.getChipId(), HEX);
@@ -691,7 +775,7 @@ void badRequest(String msg) {
   server.send(400, "application/json", json);  
 }
 
-#ifdef DEBUG_ESP_PORT
+#ifdef SIMULATE_TEMP
 void readAndSimulateTemp() {
   if(DEBUG_ESP_PORT.available() > 0) {
     char command = Serial.read();
