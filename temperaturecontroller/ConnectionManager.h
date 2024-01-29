@@ -1,4 +1,8 @@
-#include <ESP8266mDNS.h>
+#ifdef ESP8266
+  #include <ESP8266mDNS.h>
+#else
+  #include <ESPmDNS.h>
+#endif
 
 #include <SinricPro.h>
 #include <SinricProDevice.h>
@@ -55,7 +59,11 @@ public:
     // Connect to WiFi access point.
 
     WiFi.mode(WIFI_STA);
-    WiFi.hostname(hostname);
+    #ifdef ESP8266
+      WiFi.hostname(hostname);
+    #else
+      WiFi.setHostname(hostname.c_str());
+    #endif    
 
 #ifndef WLAN_SSID
     if (WiFi.SSID() != "") {
@@ -153,7 +161,13 @@ public:
       DEBUG_MSG("IP address: ");
       DEBUG_MSG(WiFi.localIP());
 
-      if (!MDNS.begin(WiFi.hostname())) {
+      #ifdef ESP8266 
+        String hostname = WiFi.hostname();
+      #else 
+        const char* hostname = WiFi.getHostname();
+      #endif
+
+      if (!MDNS.begin(hostname)) {
         DEBUG_MSG("can't init MDNS");
       }
 
@@ -166,7 +180,9 @@ public:
       digitalWrite(LED_BUILTIN, connectingLed ? LOW : HIGH);
       this->delay(500);
     } else {
-      MDNS.update();
+      #ifdef ESP8266
+        MDNS.update();
+      #endif  
     }
   }
 

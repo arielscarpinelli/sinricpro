@@ -37,7 +37,11 @@ void setupOTA(const char* password) {
       Serial.println("End Failed");
     }
   });
-  ArduinoOTA.begin(false);
+  #ifdef ESP8266
+    ArduinoOTA.begin(false);
+  #else
+    ArduinoOTA.begin(); 
+  #endif
 }
 
 void loopOTA() {

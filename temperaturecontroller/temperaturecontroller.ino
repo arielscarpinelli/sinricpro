@@ -14,11 +14,42 @@
 #include <Arduino.h>
 
 #include <OneWire.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
+
 #include <ArduinoJson.h>
 
-#include <ESP8266mDNS.h>
+
+#ifdef ESP8266
+  #include <ESP8266WiFi.h>
+  #include <ESP8266WebServer.h>
+
+  #define HEAT_SOURCE_PIN D1
+  #define HEAT_DESTINATION_PIN D2
+  
+  #define RELAY_PUMP D5
+  #define RELAY_VALVE D6
+  
+  #define SECONDARY_LED D4
+
+  ESP8266WebServer server(80);
+
+#else
+  #include <WiFi.h>
+  #include <WebServer.h>
+
+  #define HEAT_SOURCE_PIN T4
+  #define HEAT_DESTINATION_PIN T6
+
+  #define RELAY_PUMP T8
+  #define RELAY_VALVE T9
+
+  #define SECONDARY_LED 1
+  #define LED_BUILTIN 2
+
+  WebServer server(80);
+  
+#endif
+  
+
 
 // Copy config.tmpl.h to config.h and replace with your own values
 #include "config.h"
@@ -27,13 +58,6 @@
 #include "ConnectionManager.h"
 #include "OTA.h"
 
-#define HEAT_SOURCE_PIN D1
-#define HEAT_DESTINATION_PIN D2
-
-#define RELAY_PUMP D5
-#define RELAY_VALVE D6
-
-#define SECONDARY_LED D4
 
 #define RELAY_STATE_ON  LOW
 #define RELAY_STATE_OFF HIGH
@@ -43,7 +67,6 @@
 
 /************ Global State (you don't need to change this!) ******************/
 
-ESP8266WebServer server(80);
 
 TempSensor heatSource(HEAT_SOURCE_PIN); 
 TempSensor heatSink(HEAT_DESTINATION_PIN);
@@ -721,7 +744,16 @@ void handleGetStatus() {
   const size_t capacity = JSON_OBJECT_SIZE(80);
   DynamicJsonDocument doc(capacity);
 
-  doc["id"] = String(ESP.getChipId(), HEX);
+  #ifdef ESP8266
+    uint32_t chipId = ESP.getChipId();
+  #else
+    uint32_t chipId = 0;    
+    for(int i=0; i<17; i=i+8) {
+      chipId |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
+    }
+  #endif
+  
+  doc["id"] = String(chipId, HEX);
   doc["ip"] = WiFi.localIP().toString();
   doc["accessPoint"] = WiFi.SSID();
   doc["currentTime"] = time(nullptr);
