@@ -11,6 +11,7 @@
 #include <Capabilities/RangeController.h>
 #include <Capabilities/PushNotification.h>
 #include <Capabilities/PowerStateController.h>
+#include <Capabilities/TemperatureSensor.h>
 
 class SolarPoolHeather
     : public SinricProDevice,
@@ -18,12 +19,14 @@ class SolarPoolHeather
       public RangeController<SolarPoolHeather>,
       public ModeController<SolarPoolHeather>,
       public PushNotification<SolarPoolHeather>,
-      public PowerStateController<SolarPoolHeather> {
+      public PowerStateController<SolarPoolHeather>,
+      public TemperatureSensor<SolarPoolHeather> {
   friend class ToggleController<SolarPoolHeather>;
   friend class RangeController<SolarPoolHeather>;
   friend class PushNotification<SolarPoolHeather>;
   friend class ModeController<SolarPoolHeather>;
   friend class PowerStateController<SolarPoolHeather>;
+  friend class TemperatureSensor<SolarPoolHeather>;
   friend class ConnectionManager;
 
 public:
@@ -70,6 +73,7 @@ public:
       DEBUG_MSG_("Connecting to ");
       DEBUG_MSG(WiFi.SSID());
       WiFi.begin();
+      // Timeout trying to connect, then enter smartconfig
     } else {
       WiFi.beginSmartConfig();
       configuringWifi = true;
@@ -90,6 +94,12 @@ public:
       };
       if (request.request_value.containsKey("state")) {
         request.request_value[key] = request.request_value["state"];
+      };
+      if (request.request_value.containsKey("temperature")) {
+        request.request_value[key] = request.request_value["temperature"];
+      };
+      if (request.request_value.containsKey("thermostatMode")) {
+        request.request_value[key] = request.request_value["thermostatMode"];
       };
       bool ret = (onUpdate(request.request_value) == "");
       if (ret) {
@@ -200,6 +210,11 @@ public:
 
   virtual void sendRangeValue(const String& instance, float value) {
     solarPoolHeather.sendRangeValueEvent(instance, value);
+    SinricPro.handle();
+  }
+
+  virtual void sendTemperature(float value) {
+    solarPoolHeather.sendTemperatureEvent(value);
     SinricPro.handle();
   }
 

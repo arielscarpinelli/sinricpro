@@ -1,3 +1,7 @@
+#if defined(CORE_DEBUG_LEVEL) && (CORE_DEBUG_LEVEL > 0)
+  #define DEBUG_ESP_PORT Serial
+#endif
+
 #ifdef DEBUG_ESP_PORT
   #define DEBUG_MSG(...) Serial.println( __VA_ARGS__ )
   #define DEBUG_WRITE(...) Serial.write( __VA_ARGS__ )
@@ -36,14 +40,14 @@
   #include <WiFi.h>
   #include <WebServer.h>
 
-  #define HEAT_SOURCE_PIN T4
-  #define HEAT_DESTINATION_PIN T6
+  #define HEAT_SOURCE_PIN 17
+  #define HEAT_DESTINATION_PIN 16 // T2
 
   #define RELAY_PUMP T8
   #define RELAY_VALVE T9
 
-  #define SECONDARY_LED 1
   #define LED_BUILTIN 2
+  // #define SECONDARY_LED 1
 
   WebServer server(80);
   
@@ -251,7 +255,12 @@ bool timeIsUp(unsigned long startedMillis, unsigned long durationMillis, unsigne
 
 void setup() {
 
+#ifdef ESP8266
   Serial.begin(74880);
+#else
+  Serial.begin(115200);
+#endif  
+
   delay(10);
 
   pinMode(RELAY_PUMP, RELAY_PIN_OUTPUT_MODE);
@@ -261,8 +270,10 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
-  pinMode(SECONDARY_LED, OUTPUT); // NodeMCU secondary led
-  digitalWrite(SECONDARY_LED, HIGH);
+  #ifdef SECONDARY_LED
+    pinMode(SECONDARY_LED, OUTPUT); // NodeMCU secondary led
+    digitalWrite(SECONDARY_LED, HIGH);
+  #endif
 
   EEPROM.begin(sizeof(PersitentState));
 
@@ -277,6 +288,7 @@ void setup() {
   server.begin();
 
   setupOTA(OTA_PASSWORD);
+  
 }
 
 void loadState() {
@@ -303,6 +315,12 @@ ErrorReason handleUpdate(JsonObject& params) {
   if (params.containsKey("setPowerState")) {
     JsonVariant point = params["setPowerState"];
     persistentState.enabled = point == "On";
+    processed = true;
+  }
+
+  if (params.containsKey("setThermostatMode")) {
+    JsonVariant point = params["setThermostatMode"];
+    persistentState.enabled = point == "HEAT";
     processed = true;
   }
 
@@ -498,6 +516,7 @@ void publishIfNeeded() {
     if (timeIsUp(lastPublishedState.publishedMillis, transientState.minReportingIntervalMillis, now) || shouldForcePublish)  {
       if (changedSink) {
         conn.sendRangeValue("heatSinkTemperature", transientState.heatSinkTemperature);
+        conn.sendTemperature(transientState.heatSinkTemperature);
       }
       if (failedSink) {
         conn.notifyError("Unable to read temperature");
@@ -651,7 +670,9 @@ void updatePump() {
           ((transientState.heatSourceTemperature >= persistentState.maxTemperature) && heatTempDiffOverLowerThreshold)) {
         pumpSet(true);
       }
-    } else if (persistentState.stagnantTemperatureCheckIntervalMins > 0 && timeIsUp(transientState.lastStartedMillis, persistentState.stagnantTemperatureCheckIntervalMins * 60000, now)) {
+    } else if (persistentState.stagnantTemperatureCheckIntervalMins > 0 
+        && (heatTemperatureDiff >= persistentState.upperTemperatureThreshold)
+        && timeIsUp(transientState.lastStartedMillis, persistentState.stagnantTemperatureCheckIntervalMins * 60000, now)) {
       pumpSet(true);
     }
   } else {
@@ -697,7 +718,9 @@ void pumpSet(bool v) {
     DEBUG_MSG_("Setting pump to: ");
     DEBUG_MSG(v);
     digitalWrite(RELAY_PUMP, pump);
-    digitalWrite(SECONDARY_LED, pump);
+    #ifdef SECONDARY_LED
+      digitalWrite(SECONDARY_LED, pump);
+    #endif  
     transientState.pumpRunning = v;
   }
   
