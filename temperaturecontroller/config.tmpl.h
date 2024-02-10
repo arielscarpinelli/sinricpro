@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #define RELAY_PIN_OUTPUT_MODE OUTPUT // OUTPUT_OPEN_DRAIN
+#define RELAY_STATE_ON  LOW
+#define RELAY_STATE_OFF HIGH
 
 /************************* Testing *********************************/
 

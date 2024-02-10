@@ -13,6 +13,10 @@
 #include <Capabilities/PowerStateController.h>
 #include <Capabilities/TemperatureSensor.h>
 
+#define CONFIGURING_WIFI_MODE_NOT_CONFIGURING 0
+#define CONFIGURING_WIFI_MODE_SMARTCONFIG 1
+#define CONFIGURING_WIFI_MODE_AP_CONFIG 2
+
 class SolarPoolHeather
     : public SinricProDevice,
       public ToggleController<SolarPoolHeather>,
@@ -46,11 +50,11 @@ class ConnectionManager : public StateSerializer {
 protected:
   bool connectingLed = false;
   bool wifiConnected = false;
-  bool configuringWifi = false;
+  int configuringWifiMode = 0;
   bool connected = false;
+  bool offline = false;
   time_t connectionUpdatedAt;
   unsigned long nextDelayMillis = 0;
-  unsigned long now = 0;
 
   SolarPoolHeather &solarPoolHeather = SinricPro[DEVICE_ID];
 
@@ -58,7 +62,7 @@ protected:
   virtual ErrorReason onUpdate(JsonObject& params) { return "Not implmented"; };
 
 public:
-  void setup(String hostname, int timezoneOffsetSeconds) {
+  void setup(String hostname, int timezoneOffsetSeconds, bool offline) {
     // Connect to WiFi access point.
 
     WiFi.mode(WIFI_STA);
@@ -68,19 +72,23 @@ public:
       WiFi.setHostname(hostname.c_str());
     #endif    
 
-#ifndef WLAN_SSID
-    if (WiFi.SSID() != "") {
-      DEBUG_MSG_("Connecting to ");
-      DEBUG_MSG(WiFi.SSID());
-      WiFi.begin();
-      // Timeout trying to connect, then enter smartconfig
+    if(!offline) {
+    #ifndef WLAN_SSID
+      if (WiFi.SSID() != "") {
+        DEBUG_MSG_("Connecting to ");
+        DEBUG_MSG(WiFi.SSID());
+        WiFi.begin();
+        // Timeout trying to connect, then enter smartconfig
+      } else {
+        this->resetWifiConfig();
+      }
+    #else
+        WiFi.begin(WLAN_SSID, WLAN_PASS);
+    #endif
     } else {
-      WiFi.beginSmartConfig();
-      configuringWifi = true;
+      this->offline = true;
+      WiFi.softAP(hostname);
     }
-#else
-    WiFi.begin(WLAN_SSID, WLAN_PASS);
-#endif
 
     // WiFi.scanNetworksAsync(prinScanResult);
 
@@ -114,70 +122,53 @@ public:
         DEBUG_MSG("Connected to SinricPro"); 
         connected = true;
         connectionUpdatedAt = time(nullptr);
+        digitalWrite(LED_BUILTIN, LED_ON);
         onConnect(); 
     });
 
     SinricPro.onDisconnected([this]() { 
         DEBUG_MSG("Disconnected from SinricPro"); 
         connected = false;
+        connectingLed = false;
+        digitalWrite(LED_BUILTIN, LED_OFF);
         connectionUpdatedAt = time(nullptr); 
     });
 
     SinricPro.begin(APP_KEY, APP_SECRET);
   }
 
-  void delay(unsigned long millisToWait) {
-    nextDelayMillis = this->now + millisToWait;
-  }
-
   void loop(unsigned long now) {
 
-    SinricPro.handle();
-
-    this->now = now;
-
-    if (now < nextDelayMillis) {
-      delay(0);
+    if (offline) {
       return;
     }
 
-    int wifiStatus;
-
-    if (configuringWifi) {
-      if (!WiFi.smartConfigDone()) {
-        connectingLed = !connectingLed;
-        digitalWrite(LED_BUILTIN, connectingLed ? HIGH : LOW);
-        this->delay(200);
-        return;
-      }
-      configuringWifi = false;
-      WiFi.stopSmartConfig();
+    if (wifiConnected) {
+      SinricPro.handle();
     }
+
+    if (now < nextDelayMillis) {
+      return;
+    }
+    nextDelayMillis = 0;
+
+    int wifiStatus;
 
     if ((wifiStatus = WiFi.status()) != WL_CONNECTED) {
       connectingLed = !connectingLed;
-      digitalWrite(LED_BUILTIN, connectingLed ? HIGH : LOW);
+      digitalWrite(LED_BUILTIN, connectingLed ? LED_ON : LED_OFF);
       wifiConnected = false;
-      this->delay(500);
-      DEBUG_MSG_("Wifi status: ");
-      DEBUG_MSG(wifiStatus);
+      nextDelayMillis = now + this->ledBlinkDelay();
       return;
     }
 
     if (!wifiConnected) {
       wifiConnected = true;
       DEBUG_MSG("WiFi connected");
-      digitalWrite(LED_BUILTIN, HIGH);
       DEBUG_MSG("IP address: ");
       DEBUG_MSG(WiFi.localIP());
 
-      #ifdef ESP8266 
-        String hostname = WiFi.hostname();
-      #else 
-        const char* hostname = WiFi.getHostname();
-      #endif
-
-      if (!MDNS.begin(hostname)) {
+      if (!MDNS.begin(hostname())) {
         DEBUG_MSG("can't init MDNS");
       }
 
@@ -187,8 +178,8 @@ public:
 
     if (!connected) {
       connectingLed = !connectingLed;
-      digitalWrite(LED_BUILTIN, connectingLed ? LOW : HIGH);
-      this->delay(500);
+      digitalWrite(LED_BUILTIN, connectingLed ? LED_ON : LED_OFF);
+      nextDelayMillis = now + 500;
     } else {
       #ifdef ESP8266
         MDNS.update();
@@ -200,8 +191,78 @@ public:
     return connected;
   }
 
+  #ifdef ESP8266 
+    inline String hostname() {
+      return WiFi.hostname();
+    }
+  #else 
+    inline const char* hostname() {
+      return WiFi.getHostname();
+    }
+  #endif
+  
   time_t getConnectionUpdatedAt() {
     return connectionUpdatedAt;
+  }
+
+  void resetWifiConfig() {
+    connected = false;
+    wifiConnected = false;
+    offline = false;
+
+    switch(configuringWifiMode) {
+      case CONFIGURING_WIFI_MODE_NOT_CONFIGURING:
+      default:
+        configuringWifiMode = CONFIGURING_WIFI_MODE_SMARTCONFIG;
+        WiFi.beginSmartConfig();
+        break;
+
+      case CONFIGURING_WIFI_MODE_SMARTCONFIG:
+        configuringWifiMode = CONFIGURING_WIFI_MODE_AP_CONFIG;
+        WiFi.stopSmartConfig();
+        WiFi.softAP("SL12345");
+        break;
+
+      case CONFIGURING_WIFI_MODE_AP_CONFIG:
+        configuringWifiMode = CONFIGURING_WIFI_MODE_NOT_CONFIGURING;
+        WiFi.mode(WIFI_STA);
+        WiFi.begin();
+        
+        break;
+    }
+
+    DEBUG_MSG_("configuring mode ");
+    DEBUG_MSG(configuringWifiMode);
+  }
+
+  int inline ledBlinkDelay() {
+    switch(this->configuringWifiMode) {
+      case CONFIGURING_WIFI_MODE_SMARTCONFIG:
+        return 300;
+      case CONFIGURING_WIFI_MODE_AP_CONFIG:
+        return 2000;    
+      default:
+        return 800;
+    }
+  }
+
+  void config(String ssid, String pass) {
+    offline = false;
+    WiFi.mode(WIFI_STA);
+    WiFi.persistent(true);
+    WiFi.begin(ssid, pass);
+  }
+
+  void setOffline(bool o) {
+    if (o != offline) {
+      offline = o;
+      if (o) {
+        WiFi.softAP(hostname());
+      } else {
+        WiFi.mode(WIFI_STA);
+        WiFi.begin();        
+      }
+    }
   }
 
   void configureTime(int timezoneOffsetSeconds) {

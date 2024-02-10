@@ -1,3 +1,7 @@
+#define TEMP_SENSOR_CONTINUE -1
+#define TEMP_SENSOR_FAILURE 0
+#define TEMP_SENSOR_OK 1
+
 class TempSensor {
 
   private:
@@ -5,6 +9,7 @@ class TempSensor {
     int pin;
     byte addr[8];
     byte type_s;
+    unsigned long awaitUntil = 0;
 
   public:
     float value;
@@ -14,7 +19,7 @@ class TempSensor {
 
     TempSensor(int pin) : ds(OneWire(pin)), pin(pin) {}
 
-    bool search() {
+    int search() {
 
       byte i;
 
@@ -22,7 +27,6 @@ class TempSensor {
       if (!ds.search(this->addr)) {
         DEBUG_MSG_("Can't find temp sensor ");
         DEBUG_MSG(pin);
-        delay(250);
         return false;
       }
 
@@ -63,28 +67,39 @@ class TempSensor {
       
     }
 
-    bool read() {
+    int read(unsigned long now) {
       byte i;
       byte present = 0;
       byte data[12];
 
+      if (this->awaitUntil == 0) {
+
 #ifdef DEBUG_ESP_PORT
-      if (this->mock) {
-        delay(1500);
-        return true;
-      }
+        if (this->mock) {
+          this->awaitUntil = now + 1500;
+          return TEMP_SENSOR_CONTINUE;
+        }
 #endif
+  
+        if(!this->search()) {
+          return TEMP_SENSOR_FAILURE;
+        }
 
-      if(!this->search()) {
-        return false;
+        ds.reset();
+        ds.select(this->addr);
+        ds.write(0x44, 1);        // start conversion, with parasite power on at the end
+
+        this->awaitUntil = now + 1500;
+        
+        return TEMP_SENSOR_CONTINUE;
+
+      } else if(this->awaitUntil > now)  {
+        
+        return TEMP_SENSOR_CONTINUE;
+        
       }
 
-      ds.reset();
-      ds.select(this->addr);
-      ds.write(0x44, 1);        // start conversion, with parasite power on at the end
-      
-      delay(1500);     // maybe 750ms is enough, maybe not
-      // we might do a ds.depower() here, but the reset will take care of it.
+      this->awaitUntil = 0;
       
       present = ds.reset();
       ds.select(addr);    
@@ -122,13 +137,13 @@ class TempSensor {
       }
       float convertedValue = (float)raw / 16.0;
       if (convertedValue == 85.0) {
-        return false;
+        return TEMP_SENSOR_FAILURE;
       }
       value = convertedValue;
       //DEBUG_MSG_("Temperature ");
       //DEBUG_MSG_(value);
       //DEBUG_MSG("");
-      return true;
+      return TEMP_SENSOR_OK;
     }
   
 };

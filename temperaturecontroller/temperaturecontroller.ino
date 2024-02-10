@@ -34,6 +34,11 @@
   
   #define SECONDARY_LED D4
 
+  #define LED_OFF HIGH
+  #define LED_ON LOW
+
+  #define BUTTON 0
+
   ESP8266WebServer server(80);
 
 #else
@@ -47,6 +52,10 @@
   #define RELAY_VALVE T9
 
   #define LED_BUILTIN 2
+
+  #define LED_OFF HIGH
+  #define LED_ON LOW
+  
   // #define SECONDARY_LED 1
 
   WebServer server(80);
@@ -62,9 +71,6 @@
 #include "ConnectionManager.h"
 #include "OTA.h"
 
-
-#define RELAY_STATE_ON  LOW
-#define RELAY_STATE_OFF HIGH
 
 #define DEFAULT_MIN_REPORTING_INTERVAL_MILLIS 30000 // 30 secs
 #define FAILURE_REPORT_THRESHOLD 10
@@ -109,6 +115,7 @@ typedef struct PersitentState {
   int prestartSeconds;
   int stagnantTemperatureCheckIntervalMins;
   int prestartCycles;
+  bool offline;
 };
 
 struct TransientState {
@@ -153,6 +160,7 @@ void resetPersistentState() {
   persistentState.prestartSeconds = 45;
   persistentState.prestartCycles = 2;
   persistentState.stagnantTemperatureCheckIntervalMins = 30;
+  persistentState.offline = false;
 }
 
 void resetTransientState(TransientState &state) {
@@ -269,11 +277,15 @@ void setup() {
   digitalWrite(RELAY_VALVE, RELAY_STATE_OFF);
 
   pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(LED_BUILTIN, LED_OFF);
   #ifdef SECONDARY_LED
     pinMode(SECONDARY_LED, OUTPUT); // NodeMCU secondary led
-    digitalWrite(SECONDARY_LED, HIGH);
+    digitalWrite(SECONDARY_LED, LED_OFF);
   #endif
+
+  #ifdef BUTTON
+    pinMode(BUTTON, INPUT_PULLUP);
+  #endif  
 
   EEPROM.begin(sizeof(PersitentState));
 
@@ -281,14 +293,15 @@ void setup() {
   resetTransientState(transientState);
   loadState();
 
-  conn.setup(HOSTNAME, persistentState.timezoneOffsetSeconds);
+  conn.setup(HOSTNAME, persistentState.timezoneOffsetSeconds, persistentState.offline);
 
   server.on("/", HTTP_GET, handleGetStatus);
   server.on("/", HTTP_POST, handlePostConfig);
   server.begin();
 
-  setupOTA(OTA_PASSWORD);
-  
+  #ifdef OTA_PASSWORD
+    setupOTA(OTA_PASSWORD);
+  #endif
 }
 
 void loadState() {
@@ -490,6 +503,26 @@ ErrorReason handleUpdate(JsonObject& params) {
     }
   }
 
+  if (params.containsKey("ssid") && params.containsKey("pass")) {
+    JsonVariant ssid = params["ssid"];
+    JsonVariant pass = params["pass"];
+    if (ssid.is<String>() && pass.is<String>()) {
+      conn.config(ssid, pass);
+      processed = true;
+    } else {
+      return "minReportingIntervalMillis";
+    }
+  }
+
+  if (params.containsKey("offline")) {
+    JsonVariant point = params["offline"];
+    if (point.is<boolean>()) {
+      persistentState.offline = point;
+      conn.setOffline(point);
+      processed = true;
+    }
+  }
+
   if (processed) {
     saveState();
   }
@@ -547,13 +580,32 @@ bool roundAndCheckIfChanged(float &temp, float last) {
 
 unsigned long now;
 
+#ifdef BUTTON
+unsigned long buttonStarted = 0;
+
+void readButton() {
+  if(digitalRead(BUTTON) == LOW) {
+    if(!buttonStarted) {
+      buttonStarted = now;
+      DEBUG_MSG("button down");
+    } else if ((buttonStarted + 3000) <= now) {
+      DEBUG_MSG("button timeup");
+      conn.resetWifiConfig();
+      buttonStarted = 0;
+    }
+  } else {
+    buttonStarted = 0;
+  }
+}      
+#endif  
+
 void loop() {
 
   now = millis();
 
   conn.loop(now);
-  updateTemps();
-  updatePump();
+  bool tempsUpdated = updateTemps();
+  updatePump(tempsUpdated);
   updateValve();
   publishIfNeeded();
   server.handleClient();
@@ -561,42 +613,44 @@ void loop() {
 #ifdef SIMULATE_TEMP
   readAndSimulateTemp();
 #endif
+#ifdef BUTTON
+  readButton();
+#endif  
 }
 
-unsigned long lastTempRead = 0;
-
-void updateTemps() {
-
-  // Give more CPU time to comms when trying to connect.
-  if (!conn.isConnected()) {
-    if (!timeIsUp(lastTempRead, 5000, now)) {
-      return;
+bool updateTemps() {
+  
+  int tempRead = heatSource.read(now);
+  bool tempsUpdated = false;
+ 
+  if (tempRead != TEMP_SENSOR_CONTINUE) {
+    tempsUpdated = true;
+    if(tempRead == TEMP_SENSOR_OK) {
+      transientState.heatSourceTemperature = heatSource.value;
+      transientState.heatSourceFailure = false;
+    } else if (!transientState.heatSourceFailure) {
+      transientState.heatSourceFailureCount++;
+      if (transientState.heatSourceFailureCount > FAILURE_REPORT_THRESHOLD) {
+        transientState.heatSourceFailure = true;
+      }
     }
-    lastTempRead = now;
   }
   
-  //DEBUG_MSG_("Heat source");
-  if(heatSource.read()) {
-    transientState.heatSourceTemperature = heatSource.value;
-    transientState.heatSourceFailure = false;
-  } else if (!transientState.heatSourceFailure) {
-    transientState.heatSourceFailureCount++;
-    if (transientState.heatSourceFailureCount > FAILURE_REPORT_THRESHOLD) {
-      transientState.heatSourceFailure = true;
+  tempRead = heatSink.read(now);
+  if (tempRead != TEMP_SENSOR_CONTINUE) {
+    tempsUpdated = true;
+    if(tempRead == TEMP_SENSOR_OK) {
+      transientState.heatSinkTemperature = heatSink.value;
+      transientState.heatSinkFailure = false;
+    } else if (!transientState.heatSinkFailure) {
+      transientState.heatSinkFailureCount++;
+      if (transientState.heatSinkFailureCount > FAILURE_REPORT_THRESHOLD) {
+        transientState.heatSinkFailure = true;
+      }
     }
   }
 
-  //DEBUG_MSG_("Heat sink");
-  if(heatSink.read()) {
-    transientState.heatSinkTemperature = heatSink.value;
-    transientState.heatSinkFailure = false;
-  } else if (!transientState.heatSinkFailure) {
-    transientState.heatSinkFailureCount++;
-    if (transientState.heatSinkFailureCount > FAILURE_REPORT_THRESHOLD) {
-      transientState.heatSinkFailure = true;
-    }
-  }
-
+  return tempsUpdated;
 }
 
 bool applyCleaning() {
@@ -604,8 +658,8 @@ bool applyCleaning() {
   if (persistentState.cleaningDurationMinutes > 0) {
 
     // get current date
-    time_t now = time(nullptr);
-    struct tm *info = localtime(&now);
+    time_t current_time = time(nullptr);
+    struct tm *info = localtime(&current_time);
   
     info->tm_hour = persistentState.cleaningStartHour;
     info->tm_min = persistentState.cleaningStartMinute;
@@ -626,7 +680,7 @@ bool applyCleaning() {
   
 }
 
-void updatePump() {
+void updatePump(bool tempsUpdated) {
 
   if(transientState.forcePump) {
     pumpSet(true);
@@ -637,11 +691,15 @@ void updatePump() {
   if(applyCleaning()) {
     DEBUG_MSG("cleaning");
     return;
-  }  
+  }
 
   if (!persistentState.enabled) {
     pumpSet(false);
     DEBUG_MSG("disabled");
+    return;
+  }
+
+  if(!tempsUpdated) {
     return;
   }
 
@@ -719,7 +777,7 @@ void pumpSet(bool v) {
     DEBUG_MSG(v);
     digitalWrite(RELAY_PUMP, pump);
     #ifdef SECONDARY_LED
-      digitalWrite(SECONDARY_LED, pump);
+      digitalWrite(SECONDARY_LED, v ? LED_ON : LED_OFF);
     #endif  
     transientState.pumpRunning = v;
   }
