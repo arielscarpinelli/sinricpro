@@ -658,23 +658,29 @@ bool applyCleaning() {
   if (persistentState.cleaningDurationMinutes > 0) {
 
     // get current date
-    time_t current_time = time(nullptr);
-    struct tm *info = localtime(&current_time);
-  
-    info->tm_hour = persistentState.cleaningStartHour;
-    info->tm_min = persistentState.cleaningStartMinute;
-    info->tm_sec = 0;
-  
-    time_t cleaningStart = mktime(info);
-    time_t cleaningStop = cleaningStart + persistentState.cleaningDurationMinutes * 60;
+    time_t currentTime = time(nullptr);
     
-    if ((cleaningStart <= now) && (now <= cleaningStop)) {
-      transientState.cleaning = true;
-      pumpSet(true);
-      return true;
-    }  
+    // validate we actually managed to get NTP synced already
+    if (currentTime > 1704067200) { // 2024-01-01
 
-    transientState.cleaning = false;
+      struct tm *info = localtime(&currentTime);
+    
+      info->tm_hour = persistentState.cleaningStartHour;
+      info->tm_min = persistentState.cleaningStartMinute;
+      info->tm_sec = 0;
+    
+      time_t cleaningStart = mktime(info);
+      time_t cleaningStop = cleaningStart + persistentState.cleaningDurationMinutes * 60;
+      
+      if ((cleaningStart <= now) && (now <= cleaningStop)) {
+        transientState.cleaning = true;
+        pumpSet(true);
+        return true;
+      }  
+
+      transientState.cleaning = false;
+
+    }
   }
   return false;
   
