@@ -72,8 +72,8 @@
 #include "OTA.h"
 
 
-#define DEFAULT_MIN_REPORTING_INTERVAL_MILLIS 30000 // 30 secs
-#define FAILURE_REPORT_THRESHOLD 10
+#define MIN_REPORTING_INTERVAL_MILLIS 10000 // 10 secs
+#define FAILURE_REPORT_THRESHOLD 100
 
 /************ Global State (you don't need to change this!) ******************/
 
@@ -101,12 +101,13 @@ MyConnectionManager conn;
 
 typedef struct PersitentState {
   char initialized;
+  long version;
   bool enabled;
   float desiredTemperature;
   float upperTemperatureThreshold;
   float lowerTemperatureThreshold;
-  float maxTemperature;
-  float minTemperature;
+  float maxSourceTemperature;
+  float minSinkTemperature;
   int timezoneOffsetSeconds;
   int cleaningStartHour;
   int cleaningStartMinute;
@@ -114,8 +115,12 @@ typedef struct PersitentState {
   int drainSeconds;
   int prestartSeconds;
   int stagnantTemperatureCheckIntervalMins;
-  int prestartCycles;
+  bool singleTemperatureMode;
   bool offline;
+  int startHour;
+  int startMinute;
+  int stopHour;
+  int stopMinute;
 };
 
 struct TransientState {
@@ -125,18 +130,13 @@ struct TransientState {
   float heatSinkTemperature;
   bool heatSinkFailure;
   unsigned long heatSinkFailureCount;
-  float heatSourceAverageTemperatureSum;
-  unsigned int heatSourceAverageTemperatureCount;
-  float heatSourceMaxTemperature;
   bool pumpRunning;
   bool valveOpen;
   unsigned long drainStartedMillis;
   unsigned long lastStartedMillis;
-  unsigned int prestartCurrentCycle;
   bool forcePump;
   bool forceValve;
   bool cleaning;
-  unsigned long minReportingIntervalMillis;
   unsigned long publishedMillis;
 };
 
@@ -146,21 +146,26 @@ TransientState lastPublishedState;
 
 void resetPersistentState() {
   persistentState.initialized = 42;
+  persistentState.version = 1;
   persistentState.enabled = true;
   persistentState.desiredTemperature = 28;
-  persistentState.maxTemperature = 34;
+  persistentState.maxSourceTemperature = 34;
   persistentState.lowerTemperatureThreshold = 3;
   persistentState.upperTemperatureThreshold = 8;
-  persistentState.minTemperature = 20;
+  persistentState.minSinkTemperature = 20;
   persistentState.timezoneOffsetSeconds = 0;
   persistentState.cleaningStartHour = 9;
   persistentState.cleaningStartMinute = 0;
   persistentState.cleaningDurationMinutes = 10;
   persistentState.drainSeconds = 15;
   persistentState.prestartSeconds = 45;
-  persistentState.prestartCycles = 2;
   persistentState.stagnantTemperatureCheckIntervalMins = 30;
   persistentState.offline = false;
+  persistentState.singleTemperatureMode = false;
+  persistentState.startHour = -1;
+  persistentState.startMinute = 0;
+  persistentState.stopHour = 22;
+  persistentState.stopMinute = 0;
 }
 
 void resetTransientState(TransientState &state) {
@@ -176,8 +181,6 @@ void resetTransientState(TransientState &state) {
   state.heatSinkFailureCount = 0;
   state.drainStartedMillis = 0;
   state.lastStartedMillis = 0;
-  state.prestartCurrentCycle = 0;
-  state.minReportingIntervalMillis = DEFAULT_MIN_REPORTING_INTERVAL_MILLIS;
 }
 
 class JsonStateSerializer : public StateSerializer {
@@ -197,16 +200,21 @@ void serializePersistentState(StateSerializer& ser) {
   ser.sendPowerState(persistentState.enabled);
   ser.sendRangeValue("upperTemperatureThreshold", persistentState.upperTemperatureThreshold);
   ser.sendRangeValue("lowerTemperatureThreshold", persistentState.lowerTemperatureThreshold);
-  ser.sendRangeValue("maxTemperature", persistentState.maxTemperature);
-  ser.sendRangeValue("minTemperature", persistentState.minTemperature);
+  ser.sendRangeValue("maxSourceTemperature", persistentState.maxSourceTemperature);
+  ser.sendRangeValue("minSinkTemperature", persistentState.minSinkTemperature);
   ser.sendRangeValue("timezoneOffsetSeconds", persistentState.timezoneOffsetSeconds);
   ser.sendRangeValue("cleaningStartHour", persistentState.cleaningStartHour);
   ser.sendRangeValue("cleaningStartMinute", persistentState.cleaningStartMinute);
   ser.sendRangeValue("cleaningDurationMinutes", persistentState.cleaningDurationMinutes);
   ser.sendRangeValue("drainSeconds", persistentState.drainSeconds);
   ser.sendRangeValue("prestartSeconds", persistentState.prestartSeconds);
-  ser.sendRangeValue("prestartCycles", persistentState.prestartCycles);
   ser.sendRangeValue("stagnantTemperatureCheckIntervalMins", persistentState.stagnantTemperatureCheckIntervalMins); 
+  ser.sendRangeValue("singleTemperatureMode", persistentState.singleTemperatureMode); 
+  ser.sendRangeValue("startHour", persistentState.startHour);
+  ser.sendRangeValue("startHour", persistentState.startHour);
+  ser.sendRangeValue("startMinute", persistentState.startMinute);
+  ser.sendRangeValue("stopHour", persistentState.stopHour);
+  ser.sendRangeValue("stopMinute", persistentState.stopMinute);
 }
 
 void persistentStateToJson(JsonObject &json) {
@@ -216,11 +224,11 @@ void persistentStateToJson(JsonObject &json) {
 
 void transientStateToJson(JsonObject& json) {
   
-  json["heatSourceTemperature"] = transientState.heatSourceTemperature;
-  json["heatSourceAverageTemperature"] = transientState.heatSourceAverageTemperatureSum /  transientState.heatSourceAverageTemperatureCount;
-  json["heatSourceMaxTemperature"] = transientState.heatSourceMaxTemperature;
-  if (transientState.heatSourceFailure) {
-    json["heatSourceFailure"] = true;
+  if(!persistentState.singleTemperatureMode) {
+    json["heatSourceTemperature"] = transientState.heatSourceTemperature;
+    if (transientState.heatSourceFailure) {
+      json["heatSourceFailure"] = true;
+    }
   }
 
   json["heatSinkTemperature"] = transientState.heatSinkTemperature;
@@ -239,12 +247,6 @@ void transientStateToJson(JsonObject& json) {
   if (transientState.cleaning) {
     json["cleaning"] = transientState.cleaning;
   }
-
-  if (transientState.prestartCurrentCycle) {
-    json["prestartCurrentCycle"] = transientState.prestartCurrentCycle;
-  }
-
-  json["minReportingIntervalMillis"] = transientState.minReportingIntervalMillis;
 
   if (transientState.forcePump) {
     json["forcePump"] = transientState.forcePump;
@@ -309,6 +311,7 @@ void loadState() {
   if(persistentState.initialized != 42) {
     DEBUG_MSG("persistentState not initialized");
     resetPersistentState();
+    saveState();
   }
   
 }
@@ -333,7 +336,16 @@ ErrorReason handleUpdate(JsonObject& params) {
 
   if (params.containsKey("setThermostatMode")) {
     JsonVariant point = params["setThermostatMode"];
-    persistentState.enabled = point == "HEAT";
+    if (point == "HEAT") {
+      transientState.forcePump = true;
+      persistentState.enabled = true;
+    } else if (point == "OFF") {
+      transientState.forcePump = false;
+      persistentState.enabled = false;
+    } else {
+      transientState.forcePump = false;
+      persistentState.enabled = true;
+    }
     processed = true;
   }
 
@@ -367,23 +379,23 @@ ErrorReason handleUpdate(JsonObject& params) {
     }
   }
 
-  if (params.containsKey("maxTemperature")) {
-    JsonVariant point = params["maxTemperature"];
+  if (params.containsKey("maxSourceTemperature")) {
+    JsonVariant point = params["maxSourceTemperature"];
     if (point.is<float>()) {
-      persistentState.maxTemperature = point;
+      persistentState.maxSourceTemperature = point;
       processed = true;
     } else {
-      return "maxTemperature";
+      return "maxSourceTemperature";
     }
   }
 
-  if (params.containsKey("minTemperature")) {
-    JsonVariant point = params["minTemperature"];
+  if (params.containsKey("minSinkTemperature")) {
+    JsonVariant point = params["minSinkTemperature"];
     if (point.is<float>()) {
-      persistentState.minTemperature = point;
+      persistentState.minSinkTemperature = point;
       processed = true;
     } else {
-      return "minTemperature";
+      return "minSinkTemperature";
     }
   }
 
@@ -447,16 +459,6 @@ ErrorReason handleUpdate(JsonObject& params) {
     }
   }
 
-  if (params.containsKey("prestartCycles")) {
-    JsonVariant point = params["prestartCycles"];
-    if (point.is<int>()) {
-      persistentState.prestartCycles = point;
-      processed = true;
-    } else {
-      return "prestartCycles";
-    }
-  }
-
   if (params.containsKey("stagnantTemperatureCheckIntervalMins")) {
     JsonVariant point = params["stagnantTemperatureCheckIntervalMins"];
     if (point.is<int>()) {
@@ -493,13 +495,53 @@ ErrorReason handleUpdate(JsonObject& params) {
     }
   }
 
-  if (params.containsKey("minReportingIntervalMillis")) {
-    JsonVariant point = params["minReportingIntervalMillis"];
-    if (point.is<int>()) {
-      transientState.minReportingIntervalMillis = point;
+  if (params.containsKey("singleTemperatureMode")) {
+    JsonVariant point = params["singleTemperatureMode"];
+    if (point.is<bool>()) {
+      persistentState.singleTemperatureMode = point;
       processed = true;
     } else {
-      return "minReportingIntervalMillis";
+      return "singleTemperatureMode";
+    }
+  }
+
+  if (params.containsKey("startHour")) {
+    JsonVariant point = params["startHour"];
+    if (point.is<int>()) {
+      persistentState.startHour = point;
+      processed = true;
+    } else {
+      return "startHour";
+    }
+  }
+
+  if (params.containsKey("startMinute")) {
+    JsonVariant point = params["startMinute"];
+    if (point.is<int>()) {
+      persistentState.startMinute = point;
+      processed = true;
+    } else {
+      return "startMinute";
+    }
+  }
+
+  if (params.containsKey("stopHour")) {
+    JsonVariant point = params["stopHour"];
+    if (point.is<int>()) {
+      persistentState.stopHour = point;
+      processed = true;
+    } else {
+      return "stopHour";
+    }
+  }
+
+  if (params.containsKey("stopMinute")) {
+    JsonVariant point = params["stopMinute"];
+    if (point.is<int>()) {
+      persistentState.stopMinute = point;
+      processed = true;
+    } else {
+      return "stopMinute";
     }
   }
 
@@ -510,7 +552,7 @@ ErrorReason handleUpdate(JsonObject& params) {
       conn.config(ssid, pass);
       processed = true;
     } else {
-      return "minReportingIntervalMillis";
+      return "ssid";
     }
   }
 
@@ -520,6 +562,8 @@ ErrorReason handleUpdate(JsonObject& params) {
       persistentState.offline = point;
       conn.setOffline(point);
       processed = true;
+    } else {
+      return "offline";
     }
   }
 
@@ -538,17 +582,17 @@ void publishIfNeeded() {
 
   bool changedSink = roundAndCheckIfChanged(transientState.heatSinkTemperature, lastPublishedState.heatSinkTemperature);
   bool failedSink = (transientState.heatSinkFailure != lastPublishedState.heatSinkFailure);
-  bool changedSource = roundAndCheckIfChanged(transientState.heatSourceTemperature, lastPublishedState.heatSourceTemperature);
-  bool failedSource = (transientState.heatSourceFailure != lastPublishedState.heatSourceFailure);
+  bool changedSource = !persistentState.singleTemperatureMode && (transientState.heatSourceTemperature, lastPublishedState.heatSourceTemperature);
+  bool failedSource = !persistentState.singleTemperatureMode && (transientState.heatSourceFailure != lastPublishedState.heatSourceFailure);
   bool changedPumpState = (transientState.pumpRunning != lastPublishedState.pumpRunning);
 
   bool shouldForcePublish = failedSink || failedSource || changedPumpState;
 
   if (changedSink || changedSource || shouldForcePublish) {
     unsigned long now = millis();
-    if (timeIsUp(lastPublishedState.publishedMillis, transientState.minReportingIntervalMillis, now) || shouldForcePublish)  {
+    if (timeIsUp(lastPublishedState.publishedMillis, MIN_REPORTING_INTERVAL_MILLIS, now) || shouldForcePublish)  {
       if (changedSink) {
-        conn.sendRangeValue("heatSinkTemperature", transientState.heatSinkTemperature);
+        // conn.sendRangeValue("heatSinkTemperature", transientState.heatSinkTemperature);
         conn.sendTemperature(transientState.heatSinkTemperature);
       }
       if (failedSink) {
@@ -561,7 +605,8 @@ void publishIfNeeded() {
         conn.notifyError("Unable to read source temperature");
       }
       if (changedPumpState) {
-        conn.sendModeValue("pumpRunning", transientState.pumpRunning);
+        // conn.sendModeValue("pumpRunning", transientState.pumpRunning);
+        conn.sendToggleValue("pumpRunning", transientState.pumpRunning);
       }
       lastPublishedState = transientState;
       lastPublishedState.publishedMillis = now;
@@ -620,23 +665,25 @@ void loop() {
 
 bool updateTemps() {
   
-  int tempRead = heatSource.read(now);
   bool tempsUpdated = false;
- 
-  if (tempRead != TEMP_SENSOR_CONTINUE) {
-    tempsUpdated = true;
-    if(tempRead == TEMP_SENSOR_OK) {
-      transientState.heatSourceTemperature = heatSource.value;
-      transientState.heatSourceFailure = false;
-    } else if (!transientState.heatSourceFailure) {
-      transientState.heatSourceFailureCount++;
-      if (transientState.heatSourceFailureCount > FAILURE_REPORT_THRESHOLD) {
-        transientState.heatSourceFailure = true;
+
+  if (!persistentState.singleTemperatureMode) {
+    int tempRead = heatSource.read(now); 
+    if (tempRead != TEMP_SENSOR_CONTINUE) {
+      tempsUpdated = true;
+      if(tempRead == TEMP_SENSOR_OK) {
+        transientState.heatSourceTemperature = heatSource.value;
+        transientState.heatSourceFailure = false;
+      } else if (!transientState.heatSourceFailure) {
+        transientState.heatSourceFailureCount++;
+        if (transientState.heatSourceFailureCount > FAILURE_REPORT_THRESHOLD) {
+          transientState.heatSourceFailure = true;
+        }
       }
     }
   }
   
-  tempRead = heatSink.read(now);
+  int tempRead = heatSink.read(now);
   if (tempRead != TEMP_SENSOR_CONTINUE) {
     tempsUpdated = true;
     if(tempRead == TEMP_SENSOR_OK) {
@@ -709,48 +756,97 @@ void updatePump(bool tempsUpdated) {
     return;
   }
 
-  if (transientState.heatSinkTemperature < persistentState.minTemperature) {
+  if (transientState.heatSinkTemperature < persistentState.minSinkTemperature) {
     pumpSet(false);
     DEBUG_MSG("under min temperature");
     return;
   }
 
+  if (!checkStartStopTime()) {
+    pumpSet(false);
+    DEBUG_MSG("out of working hours");
+    return;
+  }
+
   float desiredTemperatureDiff = persistentState.desiredTemperature - transientState.heatSinkTemperature;
 
-  bool desiredTempDiff = (desiredTemperatureDiff > 0);
+  bool pumpStartCondition;
+  bool pumpStopCondition;
+  bool enoughHeatSource;
+  DEBUG_MSG_("c ");
+  DEBUG_MSG_(transientState.heatSinkTemperature);
 
-  float heatTemperatureDiff = transientState.heatSourceTemperature - transientState.heatSinkTemperature;
-  bool heatTempDiffOverLowerThreshold = (heatTemperatureDiff >= persistentState.lowerTemperatureThreshold);
-
-  DEBUG_MSG_("d ");
+  DEBUG_MSG_(" d ");
   DEBUG_MSG_(desiredTemperatureDiff);
 
-  DEBUG_MSG_(" h ");
-  DEBUG_MSG(heatTemperatureDiff);
+  if (!persistentState.singleTemperatureMode) {
+    float heatTemperatureDiff = transientState.heatSourceTemperature - transientState.heatSinkTemperature;
+    bool heatTempDiffOverLowerThreshold = (heatTemperatureDiff >= persistentState.lowerTemperatureThreshold);
+
+    pumpStartCondition = (desiredTemperatureDiff > 0);
+    pumpStopCondition = !heatTempDiffOverLowerThreshold;
+    enoughHeatSource = (heatTemperatureDiff >= persistentState.upperTemperatureThreshold) || 
+          ((transientState.heatSourceTemperature >= persistentState.maxSourceTemperature) && heatTempDiffOverLowerThreshold);
+
+    DEBUG_MSG_(" s ");
+    DEBUG_MSG_(transientState.heatSourceTemperature);
+
+    DEBUG_MSG_(" h ");
+    DEBUG_MSG(heatTemperatureDiff);
+
+  } else {
+    pumpStartCondition = desiredTemperatureDiff >= persistentState.lowerTemperatureThreshold;
+    pumpStopCondition = (desiredTemperatureDiff <= 0) && ((-desiredTemperatureDiff) >= persistentState.upperTemperatureThreshold);
+    enoughHeatSource = true;
+    DEBUG_MSG("");
+  }
 
   if (!transientState.pumpRunning) {
-    if(desiredTempDiff) {
-      if ((heatTemperatureDiff >= persistentState.upperTemperatureThreshold) || 
-          ((transientState.heatSourceTemperature >= persistentState.maxTemperature) && heatTempDiffOverLowerThreshold)) {
+    if(pumpStartCondition) {
+      if (enoughHeatSource) {
         pumpSet(true);
       }
     } else if (persistentState.stagnantTemperatureCheckIntervalMins > 0 
-        && (heatTemperatureDiff >= persistentState.upperTemperatureThreshold)
+        && (enoughHeatSource)
         && timeIsUp(transientState.lastStartedMillis, persistentState.stagnantTemperatureCheckIntervalMins * 60000, now)) {
       pumpSet(true);
     }
   } else {
-    if (!heatTempDiffOverLowerThreshold) {
+    if (pumpStopCondition) {
       pumpSet(false);
-    } else {
-      transientState.heatSourceAverageTemperatureCount++;
-      transientState.heatSourceAverageTemperatureSum += transientState.heatSourceTemperature;
-      if (transientState.heatSourceTemperature > transientState.heatSourceMaxTemperature) {
-        transientState.heatSourceMaxTemperature = transientState.heatSourceTemperature;
-      }
-    }
+    }  
   }
+}
+
+bool checkStartStopTime() {
+
+  if (persistentState.startHour < 0) {
+    return true;
+  }
+
+  // get current date
+  time_t currentTime = time(nullptr);
+
+  // validate we actually managed to get NTP synced already
+  if (currentTime > 1704067200) { // 2024-01-01
+
+    struct tm *info = localtime(&currentTime);
+
+    info->tm_hour = persistentState.startHour;
+    info->tm_min = persistentState.startMinute;
+    info->tm_sec = 0;
+
+    time_t start = mktime(info);
   
+    info->tm_hour = persistentState.stopHour;
+    info->tm_min = persistentState.stopMinute;
+    info->tm_sec = 0;
+
+    time_t stop = mktime(info);
+
+    return (start <= currentTime) && (currentTime <= stop);
+  }
+  return false;
 }
 
 inline int relayState(bool v) {
@@ -763,9 +859,6 @@ void pumpSet(bool v) {
     if (v) {
       transientState.lastStartedMillis = now;
       transientState.drainStartedMillis = 0;
-      transientState.heatSourceAverageTemperatureCount = 1;
-      transientState.heatSourceAverageTemperatureSum = transientState.heatSourceTemperature;
-      transientState.heatSourceMaxTemperature = transientState.heatSourceTemperature;
     } else {
       if (!transientState.drainStartedMillis) {
         DEBUG_MSG("Starting draining");
@@ -792,31 +885,19 @@ void pumpSet(bool v) {
 
 void updateValve() {
 
-  bool prestartFinishedOrOpenValveCycle = false;
+  bool prestartFinished = false;
 
-  if(!transientState.pumpRunning) {
-    transientState.prestartCurrentCycle = 0;
-  } else {
-    int totalCycles = persistentState.prestartCycles * 2 - 1;
-
-    if (transientState.prestartCurrentCycle < totalCycles) {
-      bool currentCycleFinished = timeIsUp(transientState.lastStartedMillis, (persistentState.prestartSeconds * 1000) * (transientState.prestartCurrentCycle + 1), now);
-
-      if (currentCycleFinished) {
-        transientState.prestartCurrentCycle++;
-      }
-
-      prestartFinishedOrOpenValveCycle = ((transientState.prestartCurrentCycle % 2) == 1);
-
+  if(transientState.pumpRunning) {
+    if (persistentState.prestartSeconds > 0) {
+      prestartFinished = timeIsUp(transientState.lastStartedMillis, (persistentState.prestartSeconds * 1000), now);
     } else {
-      prestartFinishedOrOpenValveCycle = true;
-    }
-
+      prestartFinished = true;
+    };
   }
 
 
   int valve = transientState.forceValve ||
-      (transientState.pumpRunning && !transientState.forcePump && prestartFinishedOrOpenValveCycle);
+      (transientState.pumpRunning && prestartFinished);
 
   if (valve != transientState.valveOpen) {
     DEBUG_MSG_("Setting valve to: ");
@@ -840,12 +921,15 @@ void handleGetStatus() {
     }
   #endif
   
-  doc["id"] = String(chipId, HEX);
+  doc["mac"] = String(chipId, HEX);
+  doc["deviceId"] = DEVICE_ID;
   doc["ip"] = WiFi.localIP().toString();
   doc["accessPoint"] = WiFi.SSID();
   doc["currentTime"] = time(nullptr);
+  doc["uptime"] = now;
   doc["wsConnected"] = conn.isConnected();
   doc["connectionUpdatedAt"] = conn.getConnectionUpdatedAt();
+  doc["configVersion"] = persistentState.version;
 
   JsonObject obj = doc.as<JsonObject>();
   persistentStateToJson(obj);
